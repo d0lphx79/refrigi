@@ -1,2 +1,6 @@
 streamlit
 google-genai
+streamlit>=1.32
+openai>=1.30
+requests>=2.31
+beautifulsoup4>=4.12
