@@ -240,8 +240,17 @@ def recipe_from_url(url: str) -> dict[str, Any]:
     parsed = urlparse(url)
     if parsed.scheme not in {"https", "http"}:
         raise ValueError("http 또는 https 주소를 입력해 주세요.")
-    response = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-    response.raise_for_status()
+    try:
+        response = requests.get(url, timeout=15, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+            "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.7",
+        })
+        response.raise_for_status()
+    except requests.RequestException:
+        return {
+            "name": f"{parsed.netloc}에서 가져온 레시피", "ingredients": [], "instructions": "",
+            "notice": "이 블로그는 자동 읽기를 제한하고 있어요. 아래 입력칸에 재료 부분을 복사해 붙여 넣어 주세요.",
+        }
     soup = BeautifulSoup(response.text, "html.parser")
     candidates = []
     for tag in soup.select('script[type="application/ld+json"]'):
@@ -263,10 +272,21 @@ def recipe_from_url(url: str) -> dict[str, Any]:
                 if found: return found
         return None
     recipe = find_recipe(candidates)
-    if not recipe: raise ValueError("이 페이지에서 표준 레시피 정보를 찾지 못했어요. 직접 등록해 주세요.")
-    return {"name": recipe.get("name", "가져온 레시피"),
-            "ingredients": recipe.get("recipeIngredient", []),
-            "instructions": recipe.get("recipeInstructions", "")}
+    if recipe:
+        return {"name": recipe.get("name", "가져온 레시피"),
+                "ingredients": recipe.get("recipeIngredient", []),
+                "instructions": recipe.get("recipeInstructions", ""), "notice": ""}
+    # Many Korean blog platforms omit Recipe JSON-LD. Use the title and visible
+    # text instead, then give the user a reviewable editable recipe form.
+    for node in soup(["script", "style", "noscript"]):
+        node.decompose()
+    title_tag = soup.select_one('meta[property="og:title"]') or soup.title
+    title = title_tag.get("content", "") if title_tag and title_tag.name == "meta" else (title_tag.get_text(" ", strip=True) if title_tag else "")
+    text = "\n".join(line.strip() for line in soup.get_text("\n").splitlines() if line.strip())
+    extracted = recipe_from_blog_text(text, url)
+    extracted["name"] = title or extracted["name"]
+    extracted["notice"] = "블로그의 일반 본문에서 재료를 추출했어요. 저장 전 수량과 단위를 확인해 주세요."
+    return extracted
 
 
 def parse_web_ingredients(raw: list[str]) -> list[dict[str, Any]]:
@@ -274,11 +294,42 @@ def parse_web_ingredients(raw: list[str]) -> list[dict[str, Any]]:
     unit_re = "|".join(re.escape(u) for u in UNITS)
     for line in raw:
         text = re.sub(r"\s+", " ", unescape(str(line))).strip()
-        match = re.match(rf"([0-9]+(?:\.[0-9]+)?)\s*({unit_re})?\s*(.+)", text)
+        match = re.match(rf"(?:[-•*]\s*)?([0-9]+(?:/[0-9]+|\.[0-9]+)?)\s*({unit_re})?\s*(.+)", text)
         if match:
             qty, unit, name = match.groups()
-            parsed.append({"name": name.strip(), "quantity": float(qty), "unit": unit or "개"})
-    return parsed
+            quantity = _as_quantity(qty)
+            if quantity:
+                parsed.append({"name": name.strip(" :,-"), "quantity": quantity, "unit": unit or "개"})
+            continue
+        # Korean blogs commonly write “양파 1개” rather than “1개 양파”.
+        reverse = re.match(rf"(?:[-•*]\s*)?(.{{1,35}}?)\s*[:：,-]?\s*([0-9]+(?:/[0-9]+|\.[0-9]+)?)\s*({unit_re})\b", text)
+        if reverse:
+            name, qty, unit = reverse.groups()
+            quantity = _as_quantity(qty)
+            if quantity and len(name.strip()) > 1:
+                parsed.append({"name": name.strip(" :,-"), "quantity": quantity, "unit": unit})
+    unique: dict[tuple[str, str], dict[str, Any]] = {}
+    for ingredient in parsed:
+        unique.setdefault((ingredient["name"], ingredient["unit"]), ingredient)
+    return list(unique.values())[:6]
+
+
+def _as_quantity(value: str) -> float | None:
+    try:
+        if "/" in value:
+            top, bottom = value.split("/", 1)
+            return float(top) / float(bottom)
+        return float(value)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def recipe_from_blog_text(text: str, source_url: str = "") -> dict[str, Any]:
+    lines = [line.strip() for line in re.split(r"[\n\r]+", text) if line.strip()]
+    ingredients = parse_web_ingredients(lines)
+    title = lines[0][:70] if lines else "가져온 블로그 레시피"
+    return {"name": title, "ingredients": ingredients, "instructions": "\n".join(lines[:80]),
+            "source_url": source_url, "notice": ""}
 
 
 def smart_recipe_suggestions(items: list[sqlite3.Row]) -> list[dict[str, str]]:
@@ -311,6 +362,10 @@ def smart_recipe_suggestions(items: list[sqlite3.Row]) -> list[dict[str, str]]:
 
 def set_page(page: str) -> None:
     st.session_state.page = page
+    if page == "home":
+        st.query_params.clear()
+    else:
+        st.query_params["page"] = page
 
 
 def top_bar(back: bool = True) -> None:
@@ -332,24 +387,14 @@ def page_home() -> None:
     if alerts:
         names = ", ".join(f"{x['name']} (D-{days_left(x)})" for x in alerts)
         st.warning(f"유통기한 알림: {names}. 임박 재료를 먼저 사용해 보세요.")
-    st.markdown("""<style>
-      button[data-testid='stBaseButton-secondary'] {
-        height: clamp(125px, 22vw, 240px); white-space: pre-line;
-        font-family: 'Nanum Myeongjo','HCR Batang',serif; font-size: clamp(1rem,2.6vw,1.65rem);
-        font-weight: 700; color:#252525; background:linear-gradient(135deg,#fff,#f0f4f5);
-        border:1px solid #bbc5c9; border-radius:10px; box-shadow:inset -8px -4px 14px #d8e0e3;
-        transition:transform .25s, background .25s;
-      }
-      button[data-testid='stBaseButton-secondary']:hover { transform:perspective(600px) rotateY(-7deg); background:#fffdf9; }
-    </style>""", unsafe_allow_html=True)
-    doors = [("🥬", "식재료 / 음식", "inventory"), ("🍳", "레시피", "recipes"),
-             ("💰", "이번달 식비 절약", "savings"), ("⏰", "유통기한 임박", "expiry")]
-    with st.container(border=True):
-        for row_items in (doors[:2], doors[2:]):
-            cols = st.columns(2, gap="small")
-            for col, (icon, label, target) in zip(cols, row_items):
-                with col:
-                    st.button(f"{icon}\n{label}", key=f"door_{target}", on_click=set_page, args=(target,), use_container_width=True)
+    st.markdown("""
+      <div class="fridge" aria-label="냉장고 메뉴">
+        <a class="fridge-door top-left" href="?page=inventory"><span class="handle"></span><span class="door-icon">🥬</span><span class="door-name">식재료 / 음식</span></a>
+        <a class="fridge-door top-right" href="?page=recipes"><span class="handle"></span><span class="door-icon">🍳</span><span class="door-name">레시피</span></a>
+        <a class="fridge-door bottom-left" href="?page=savings"><span class="handle"></span><span class="door-icon">💰</span><span class="door-name">이번달 식비 절약</span></a>
+        <a class="fridge-door bottom-right" href="?page=expiry"><span class="handle"></span><span class="door-icon">⏰</span><span class="door-name">유통기한 임박</span></a>
+      </div>
+    """, unsafe_allow_html=True)
     linked = household_code() != "우리집-냉장고"
     if linked:
         st.markdown("<style>button[data-testid='stBaseButton-primary'] {background:#8a8a8a !important; border-color:#8a8a8a !important;}</style>", unsafe_allow_html=True)
@@ -454,7 +499,7 @@ def add_recipe_form(prefill: dict[str, Any] | None = None) -> None:
     ingredients_default = prefill.get("ingredients", []) if prefill else []
     with st.form("recipe_form", clear_on_submit=True):
         name = st.text_input("레시피 이름 *", value=name_default)
-        source = st.text_input("출처 URL (선택)")
+        source = st.text_input("출처 URL (선택)", value=prefill.get("source_url", "") if prefill else "")
         instruction = st.text_area("조리 방법 (선택)", value=str(prefill.get("instructions", "")) if prefill else "")
         photo = st.file_uploader("레시피 사진 (선택)", type=["jpg", "jpeg", "png", "webp"], key="recipe_photo")
         st.caption("재료와 필요한 양을 입력하세요. 단위가 냉장고 재고와 같아야 자동 차감됩니다.")
@@ -482,12 +527,17 @@ def page_recipes() -> None:
     if c2.button("🌐 인터넷에서 가져오기", use_container_width=True): st.session_state.import_recipe_open = not st.session_state.get("import_recipe_open", False)
     if st.session_state.get("import_recipe_open"):
         url = st.text_input("레시피 페이지 URL", placeholder="https://...")
-        if st.button("가져오기") and url:
+        pasted = st.text_area("블로그 재료/본문 붙여넣기 (선택)",
+                              placeholder="접근이 제한된 블로그라면 ‘재료’ 부분을 복사해 붙여 넣으세요. 예: 양파 1개\n계란 2개")
+        if st.button("가져오기") and (url or pasted):
             try:
-                extracted = recipe_from_url(url)
-                parsed = parse_web_ingredients(extracted["ingredients"])
-                if not parsed: st.warning("재료 양을 자동 해석하지 못했어요. 아래에서 직접 입력해 주세요.")
-                st.session_state.recipe_prefill = {"name": extracted["name"], "ingredients": parsed, "instructions": str(extracted["instructions"])}
+                extracted = recipe_from_blog_text(pasted, url) if pasted.strip() else recipe_from_url(url)
+                raw_ingredients = extracted["ingredients"]
+                parsed = raw_ingredients if raw_ingredients and isinstance(raw_ingredients[0], dict) else parse_web_ingredients(raw_ingredients)
+                if not parsed: st.warning("재료의 수량/단위를 자동 해석하지 못했어요. 아래에서 직접 입력해 주세요.")
+                if extracted.get("notice"): st.info(extracted["notice"])
+                st.session_state.recipe_prefill = {"name": extracted["name"], "ingredients": parsed,
+                                                    "instructions": str(extracted["instructions"]), "source_url": url}
                 st.session_state.add_recipe_open = True
             except Exception as exc: st.error(f"가져오지 못했어요: {exc}")
     if st.session_state.get("add_recipe_open"):
@@ -612,13 +662,21 @@ def inject_css() -> None:
       .app-title { text-align:center; margin: 1.2rem 0 .2rem; font-family:'Nanum Myeongjo','HCR Batang',serif; font-size:clamp(1.9rem,7vw,4rem); color:#121212; }
       .home-subtitle { text-align:center; color:#6d625b; margin-bottom:1rem; }
       .home-date { position:absolute; top:1.2rem; left:1.4rem; color:#544a44; font-size:.9rem; }
+      .fridge { max-width:720px; margin:0 auto 1.2rem; padding:clamp(9px,2vw,18px); display:grid; grid-template-columns:1fr 1fr; gap:8px; background:linear-gradient(135deg,#e6ecef,#aebac0); border:9px solid #c5d0d5; border-radius:28px; box-shadow:11px 13px 0 #99a6ad; }
+      .fridge-door { position:relative; min-height:clamp(138px,22vw,245px); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:.55rem; overflow:hidden; text-decoration:none !important; color:#191919 !important; background:linear-gradient(135deg,#ffffff 0%,#f3f6f7 68%,#dbe3e6 100%); border:1px solid #b8c4c9; border-radius:12px; box-shadow:inset -10px -8px 16px rgba(115,137,145,.17), inset 4px 4px 8px rgba(255,255,255,.9); transition:transform .26s ease, filter .26s ease; }
+      .fridge-door:hover, .fridge-door:focus { transform:perspective(780px) rotateY(-9deg) translateY(-2px); filter:brightness(1.03); }
+      .fridge-door .handle { position:absolute; width:7px; height:40%; right:13px; top:30%; border-radius:7px; background:linear-gradient(90deg,#aebbc1,#eff4f5,#93a2a8); box-shadow:1px 1px 2px #7f8b90; }
+      .fridge-door.top-right .handle, .fridge-door.bottom-right .handle { left:13px; right:auto; }
+      .door-icon { font-size:clamp(2rem,5vw,3.6rem); line-height:1; transition:transform .25s ease; }
+      .fridge-door:hover .door-icon { transform:scale(1.12); }
+      .door-name { max-width:80%; text-align:center; font-family:'Nanum Myeongjo','HCR Batang',serif; font-size:clamp(.88rem,2.5vw,1.4rem); font-weight:700; line-height:1.35; }
       .food-image { min-height:94px; display:grid; place-items:center; font-size:4rem; background:#fff7e8; border-radius:10px; }
       .expiry-card { padding: .85rem 1rem; border-radius:10px; font-size:1.1rem; color:#21110c; }
       .expiry-card span { font-size:.85rem; } .expiry-card.urgent {background:#f8b2ad;} .expiry-card.warning {background:#ffd198;} .expiry-card.soon {background:#ffefad;}
       .saving-hero { text-align:center; font-family:'Nanum Myeongjo',serif; font-size:clamp(1.6rem,5vw,2.8rem); font-weight:700; padding:1.5rem 1rem; background:#fff; border-radius:18px; }
       .saving-hero strong { display:block; color:#1e7a47; font-size:clamp(2.2rem,8vw,4.5rem); margin:.4rem; } .saving-hero span { display:block; font: .9rem sans-serif; color:#6b635f; }
       .suggestion { padding:.85rem 1rem; margin:.5rem 0; background:#fff; border-left:6px solid #ef9c4e; border-radius:8px; }
-      @media(max-width: 480px) { .home-date {position:static; margin:.7rem 0 0;} .fridge-shell {border-width:5px; box-shadow:4px 5px 0 #aeb9be;} .block-container {padding-top:.5rem;} }
+      @media(max-width: 480px) { .home-date {position:static; margin:.7rem 0 0;} .fridge {border-width:5px; border-radius:18px; box-shadow:5px 6px 0 #99a6ad; gap:5px; padding:7px;} .fridge-door {border-radius:8px;} .fridge-door .handle {right:7px; width:5px;} .fridge-door.top-right .handle,.fridge-door.bottom-right .handle {left:7px;} .block-container {padding-top:.5rem;} }
     </style>
     """, unsafe_allow_html=True)
 
@@ -626,6 +684,9 @@ def inject_css() -> None:
 def main() -> None:
     st.set_page_config(page_title="What's in my 냉장고?", page_icon="🧊", layout="centered")
     setup_database(); household_code(); inject_css()
+    requested_page = st.query_params.get("page")
+    if requested_page in {"home", "inventory", "recipes", "expiry", "savings", "family"}:
+        st.session_state.page = requested_page
     page = st.session_state.get("page", "home")
     {"home": page_home, "inventory": page_inventory, "recipes": page_recipes,
      "expiry": page_expiry, "savings": page_savings, "family": page_family}.get(page, page_home)()
@@ -633,4 +694,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
